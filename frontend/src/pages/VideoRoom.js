@@ -1,0 +1,860 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import io from 'socket.io-client';
+import Peer from 'simple-peer';
+import {
+  Box,
+  Button,
+  IconButton,
+  Paper,
+  TextField,
+  Typography,
+  AppBar,
+  Toolbar,
+  Drawer,
+  List,
+  ListItem,
+  Chip,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Avatar
+} from '@mui/material';
+import MicIcon from '@mui/icons-material/Mic';
+import MicOffIcon from '@mui/icons-material/MicOff';
+import VideocamIcon from '@mui/icons-material/Videocam';
+import VideocamOffIcon from '@mui/icons-material/VideocamOff';
+import ScreenShareIcon from '@mui/icons-material/ScreenShare';
+import StopScreenShareIcon from '@mui/icons-material/StopScreenShare';
+import CallEndIcon from '@mui/icons-material/CallEnd';
+import ChatIcon from '@mui/icons-material/Chat';
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import ShareIcon from '@mui/icons-material/Share';
+import LinkIcon from '@mui/icons-material/Link';
+import CloseIcon from '@mui/icons-material/Close';
+import PersonIcon from '@mui/icons-material/Person';
+
+import { SOCKET_URL } from '../config';
+
+function VideoRoom({ user }) {
+  const { roomId } = useParams();
+  const navigate = useNavigate();
+  const [peers, setPeers] = useState([]);
+  const [audioEnabled, setAudioEnabled] = useState(true);
+  const [videoEnabled, setVideoEnabled] = useState(true);
+  const [screenSharing, setScreenSharing] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [newMessage, setNewMessage] = useState('');
+  const [copied, setCopied] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [roomStatus, setRoomStatus] = useState('connecting');
+  const [admissionRequests, setAdmissionRequests] = useState([]);
+  const [isHost, setIsHost] = useState(false);
+  const [captions, setCaptions] = useState([]);
+
+  const socketRef = useRef();
+  const recognitionRef = useRef(null);
+  const captionsTimeoutRef = useRef(null);
+  const userVideo = useRef();
+  const peersRef = useRef([]);
+  const screenStreamRef = useRef();
+  const userStreamRef = useRef();
+
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    socketRef.current = io(SOCKET_URL, {
+      auth: { token }
+    });
+
+    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      .then(stream => {
+        userStreamRef.current = stream;
+
+        socketRef.current.emit('join-room', {
+          roomId,
+          userId: user.id,
+          userName: user.name
+        });
+
+        socketRef.current.on('join-approved', () => {
+          setRoomStatus('approved');
+        });
+
+        socketRef.current.on('waiting-for-approval', () => {
+          setRoomStatus('waiting');
+        });
+
+        socketRef.current.on('join-denied', () => {
+          setRoomStatus('denied');
+        });
+
+        socketRef.current.on('you-are-host', () => {
+          setIsHost(true);
+        });
+
+        socketRef.current.on('meeting-ended', ({ summary }) => {
+          if (recognitionRef.current) {
+            recognitionRef.current.stop();
+          }
+          alert(`Meeting ended by host.\n\nSummary:\n${summary}`);
+          navigate('/dashboard');
+        });
+
+        socketRef.current.on('admission-request', ({ socketId, userName }) => {
+          setAdmissionRequests(prev => [...prev, { socketId, userName }]);
+        });
+
+        // ✅ FIX: New joiner gets existing users and creates peers for each
+        socketRef.current.on('existing-users', users => {
+          // Clear any stale peers first
+          peersRef.current.forEach(({ peer }) => {
+            if (!peer.destroyed) peer.destroy();
+          });
+          peersRef.current = [];
+
+          const newPeers = [];
+          users.forEach(existingUser => {
+            if (existingUser.socketId === socketRef.current.id) return;
+            // ✅ Guard: don't create duplicate
+            if (peersRef.current.find(p => p.peerID === existingUser.socketId)) return;
+
+            const peer = createPeer(existingUser.socketId, socketRef.current.id, stream);
+            const peerObj = {
+              peerID: existingUser.socketId,
+              peer,
+              userName: existingUser.userName
+            };
+            peersRef.current.push(peerObj);
+            newPeers.push(peerObj);
+          });
+          setPeers(newPeers);
+        });
+
+        // ✅ FIX: Existing user receives signal from new joiner
+        socketRef.current.on('user-connected', ({ signal, socketId, userName }) => {
+          // ✅ Guard: ignore if peer already exists
+          if (peersRef.current.find(p => p.peerID === socketId)) return;
+
+          const peer = addPeer(signal, socketId, stream);
+          const peerObj = { peerID: socketId, peer, userName };
+          peersRef.current.push(peerObj);
+          // ✅ FIX: Use functional update to avoid stale state overwrite
+          setPeers(prev => {
+            if (prev.find(p => p.peerID === socketId)) return prev;
+            return [...prev, peerObj];
+          });
+        });
+
+        socketRef.current.on('receiving-returned-signal', payload => {
+          const item = peersRef.current.find(p => p.peerID === payload.id);
+          if (item && item.peer && !item.peer.destroyed) {
+            item.peer.signal(payload.signal);
+          }
+        });
+
+        socketRef.current.on('user-disconnected', ({ socketId }) => {
+          const peerObj = peersRef.current.find(p => p.peerID === socketId);
+          if (peerObj && !peerObj.peer.destroyed) {
+            peerObj.peer.destroy();
+          }
+          peersRef.current = peersRef.current.filter(p => p.peerID !== socketId);
+          setPeers(prev => prev.filter(p => p.peerID !== socketId));
+        });
+
+        socketRef.current.on('chat-history', history => {
+          setMessages(history);
+        });
+
+        socketRef.current.on('new-message', message => {
+          setMessages(prev => [...prev, message]);
+          setUnreadCount(prev => prev + 1);
+        });
+
+        socketRef.current.on('new-transcript', entry => {
+          setCaptions(prev => [...prev.slice(-2), entry]);
+          if (captionsTimeoutRef.current) clearTimeout(captionsTimeoutRef.current);
+          captionsTimeoutRef.current = setTimeout(() => {
+            setCaptions([]);
+          }, 8000);
+        });
+      })
+      .catch(err => {
+        console.error('Error accessing media devices:', err);
+        alert('Please allow camera and microphone access');
+      });
+
+    return () => {
+      if (captionsTimeoutRef.current) clearTimeout(captionsTimeoutRef.current);
+      if (userStreamRef.current) {
+        userStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
+    };
+  }, [roomId, user, navigate]);
+
+  useEffect(() => {
+    if (chatOpen) setUnreadCount(0);
+  }, [chatOpen]);
+
+  const audioEnabledRef = useRef(audioEnabled);
+  useEffect(() => {
+    audioEnabledRef.current = audioEnabled;
+  }, [audioEnabled]);
+
+  useEffect(() => {
+    let recognition = null;
+    let isComponentMounted = true;
+    let hasFatalError = false;
+    let fallbackRecorder = null;
+    let fallbackInterval = null;
+
+    const startFallbackTranscription = () => {
+      if (!userStreamRef.current || !isComponentMounted) return;
+      try {
+        const stream = userStreamRef.current;
+        let options = { mimeType: 'audio/webm' };
+        if (!MediaRecorder.isTypeSupported('audio/webm')) {
+            options = { mimeType: 'audio/mp4' }; 
+        }
+        
+        fallbackRecorder = new MediaRecorder(stream, options);
+        fallbackRecorder.ondataavailable = (e) => {
+            console.log("[FallbackTranscription] Chunk generated. Size:", e.data.size, "Bytes. AudioEnabled:", audioEnabledRef.current);
+            if (e.data.size > 0 && socketRef.current && audioEnabledRef.current) {
+                const reader = new FileReader();
+                reader.readAsDataURL(e.data);
+                reader.onloadend = () => {
+                    const base64data = reader.result.split(',')[1];
+                    console.log("[FallbackTranscription] Emitting base64 chunk to server...");
+                    socketRef.current.emit('send-audio-chunk', {
+                        roomId,
+                        userName: user.name,
+                        audioData: base64data,
+                        mimeType: fallbackRecorder.mimeType || options.mimeType
+                    });
+                };
+            }
+        };
+        
+        fallbackRecorder.start();
+        
+        fallbackInterval = setTimeout(() => {
+            if (fallbackRecorder && fallbackRecorder.state === 'recording') {
+                fallbackRecorder.stop();
+            }
+            if (isComponentMounted) {
+                startFallbackTranscription();
+            }
+        }, 8000);
+      } catch (e) {
+        console.warn("Fallback transcription failed to start:", e);
+      }
+    };
+
+    if (roomStatus === 'approved') {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition && !recognitionRef.current) {
+        recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.lang = 'en-US';
+
+        recognition.onresult = (event) => {
+          if (!audioEnabledRef.current) return;
+
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            if (event.results[i].isFinal) {
+              const transcriptText = event.results[i][0].transcript;
+              console.log("[SpeechRecognition] Captured final text:", transcriptText);
+              if (socketRef.current && transcriptText.trim()) {
+                socketRef.current.emit('send-transcript', {
+                  roomId,
+                  userName: user.name,
+                  text: transcriptText.trim()
+                });
+              }
+            } else {
+              console.log("[SpeechRecognition] Interim text:", event.results[i][0].transcript);
+            }
+          }
+        };
+
+        recognition.onerror = (event) => {
+          console.warn('[SpeechRecognition] Error encountered:', event.error);
+          if (event.error === 'not-allowed' || event.error === 'audio-capture' || event.error === 'aborted') {
+            if (!hasFatalError) {
+              hasFatalError = true;
+              console.log("[SpeechRecognition] Switching to fallback AI audio transcription...");
+              startFallbackTranscription();
+            }
+          }
+        };
+
+        recognition.onend = () => {
+          if (isComponentMounted && recognitionRef.current && !hasFatalError) {
+            setTimeout(() => {
+              if (isComponentMounted && recognitionRef.current && !hasFatalError) {
+                try { recognition.start(); } catch (e) {}
+              }
+            }, 250);
+          }
+        };
+
+        recognitionRef.current = recognition;
+        console.log("[SpeechRecognition] Successfully started native browser transcription");
+        try { recognition.start(); } catch (e) {
+          console.error("[SpeechRecognition] Failed to start:", e);
+        }
+      } else if (!SpeechRecognition) {
+        startFallbackTranscription();
+      }
+    }
+
+    return () => {
+      isComponentMounted = false;
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch (e) {}
+        recognitionRef.current = null;
+      }
+      if (fallbackRecorder && fallbackRecorder.state === 'recording') {
+        fallbackRecorder.stop();
+      }
+      if (fallbackInterval) {
+        clearTimeout(fallbackInterval);
+      }
+    };
+  }, [roomStatus, roomId, user.name]);
+
+  useEffect(() => {
+    if (roomStatus === 'approved' && userVideo.current && userStreamRef.current) {
+      userVideo.current.srcObject = userStreamRef.current;
+    }
+  }, [roomStatus]);
+
+  function createPeer(userToSignal, callerID, stream) {
+    const peer = new Peer({
+      initiator: true,
+      trickle: false,
+      stream,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' }
+        ]
+      }
+    });
+
+    peer.on('signal', signal => {
+      socketRef.current.emit('sending-signal', { userToSignal, callerID, signal });
+    });
+
+    peer.on('error', err => {
+      console.warn('Peer error (createPeer):', err.message);
+    });
+
+    // Capture remote stream instantly to prevent race conditions
+    peer.on('stream', remoteStream => {
+      peer.remoteStream = remoteStream;
+    });
+
+    return peer;
+  }
+
+  function addPeer(incomingSignal, callerID, stream) {
+    const peer = new Peer({
+      initiator: false,
+      trickle: false,
+      stream,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' }
+        ]
+      }
+    });
+
+    peer.on('signal', signal => {
+      socketRef.current.emit('returning-signal', { signal, callerID });
+    });
+
+    peer.on('error', err => {
+      console.warn('Peer error (addPeer):', err.message);
+    });
+
+    // Capture remote stream instantly to prevent race conditions
+    peer.on('stream', remoteStream => {
+      peer.remoteStream = remoteStream;
+    });
+
+    peer.signal(incomingSignal);
+    return peer;
+  }
+
+  const toggleAudio = () => {
+    if (userStreamRef.current) {
+      const audioTrack = userStreamRef.current.getAudioTracks()[0];
+      audioTrack.enabled = !audioTrack.enabled;
+      setAudioEnabled(audioTrack.enabled);
+    }
+  };
+
+  const toggleVideo = () => {
+    if (userStreamRef.current) {
+      const videoTrack = userStreamRef.current.getVideoTracks()[0];
+      videoTrack.enabled = !videoTrack.enabled;
+      setVideoEnabled(videoTrack.enabled);
+      if (userVideo.current) {
+        userVideo.current.srcObject = userStreamRef.current;
+      }
+    }
+  };
+
+  const toggleScreenShare = async () => {
+    if (!screenSharing) {
+      try {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: false
+        });
+        screenStreamRef.current = screenStream;
+        const screenTrack = screenStream.getVideoTracks()[0];
+
+        peersRef.current.forEach(({ peer }) => {
+          const sender = peer._pc.getSenders().find(s => s.track?.kind === 'video');
+          if (sender) sender.replaceTrack(screenTrack);
+        });
+
+        screenTrack.onended = () => stopScreenShare();
+        setScreenSharing(true);
+      } catch (err) {
+        console.error('Error sharing screen:', err);
+      }
+    } else {
+      stopScreenShare();
+    }
+  };
+
+  const stopScreenShare = () => {
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach(track => track.stop());
+
+      const originalTrack = userStreamRef.current.getVideoTracks()[0];
+      originalTrack.enabled = videoEnabled;
+
+      peersRef.current.forEach(({ peer }) => {
+        const sender = peer._pc.getSenders().find(s => s.track?.kind === 'video');
+        if (sender) sender.replaceTrack(originalTrack);
+      });
+
+      if (userVideo.current) {
+        userVideo.current.srcObject = userStreamRef.current;
+      }
+    }
+    setScreenSharing(false);
+  };
+
+  const leaveRoom = () => {
+    if (userStreamRef.current) {
+      userStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+    navigate('/dashboard');
+  };
+
+  const endMeeting = () => {
+    if (window.confirm("Are you sure you want to end the meeting for everyone? This will generate a summary and close the room.")) {
+      socketRef.current.emit('end-meeting', { roomId });
+    }
+  };
+
+  const sendMessage = () => {
+    if (newMessage.trim()) {
+      const msg = {
+        userName: user.name,
+        message: newMessage,
+        timestamp: new Date().toISOString()
+      };
+      setMessages(prev => [...prev, msg]);
+      socketRef.current.emit('send-message', {
+        roomId,
+        message: newMessage,
+        userName: user.name
+      });
+      setNewMessage('');
+    }
+  };
+
+  const admitUser = (socketId) => {
+    socketRef.current.emit('admit-user', { roomId, socketId });
+    setAdmissionRequests(prev => prev.filter(r => r.socketId !== socketId));
+  };
+
+  const denyUser = (socketId) => {
+    socketRef.current.emit('deny-user', { roomId, socketId });
+    setAdmissionRequests(prev => prev.filter(r => r.socketId !== socketId));
+  };
+
+  const copyRoomId = () => {
+    navigator.clipboard.writeText(roomId);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const getMeetingLink = () => `${window.location.origin}/room/${roomId}`;
+
+  const copyMeetingLink = () => {
+    navigator.clipboard.writeText(getMeetingLink());
+    setLinkCopied(true);
+    setTimeout(() => setLinkCopied(false), 2000);
+  };
+
+  const shareMeetingLink = async () => {
+    const link = getMeetingLink();
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'Join my Collab Space meeting',
+          text: `Join my video meeting on Collab Space. Room code: ${roomId}`,
+          url: link,
+        });
+      } catch (err) {
+        copyMeetingLink();
+      }
+    } else {
+      copyMeetingLink();
+    }
+  };
+
+  if (roomStatus === 'waiting') {
+    return (
+      <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', bgcolor: '#121212', gap: 3 }}>
+        <Box sx={{ width: 64, height: 64, borderRadius: '50%', bgcolor: 'primary.main', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <PersonIcon sx={{ fontSize: 36, color: 'white' }} />
+        </Box>
+        <Typography variant="h5" color="white">Waiting to be admitted</Typography>
+        <Typography variant="body2" color="grey.500">The host will let you in soon</Typography>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1 }}>
+          <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: 'primary.main' }} />
+          <Typography variant="caption" color="grey.500">Room: {roomId}</Typography>
+        </Box>
+        <Button variant="outlined" color="error" onClick={() => navigate('/dashboard')} sx={{ mt: 2 }}>
+          Cancel
+        </Button>
+      </Box>
+    );
+  }
+
+  if (roomStatus === 'denied') {
+    return (
+      <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', bgcolor: '#121212', gap: 3 }}>
+        <Box sx={{ width: 64, height: 64, borderRadius: '50%', bgcolor: 'error.main', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <CloseIcon sx={{ fontSize: 36, color: 'white' }} />
+        </Box>
+        <Typography variant="h5" color="white">Entry Denied</Typography>
+        <Typography variant="body2" color="grey.500">The host did not admit you to this meeting</Typography>
+        <Button variant="contained" onClick={() => navigate('/dashboard')} sx={{ mt: 2 }}>
+          Back to Dashboard
+        </Button>
+      </Box>
+    );
+  }
+
+  return (
+    <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column', bgcolor: '#000', overflow: 'hidden' }}>
+      <AppBar position="static" color="transparent" elevation={0}>
+        <Toolbar sx={{ gap: 1, flexWrap: 'wrap' }}>
+          <Typography variant="h6" sx={{ flexGrow: 1, color: 'white', fontSize: { xs: 14, sm: 20 } }}>
+            Room: {roomId}
+          </Typography>
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={copyRoomId}
+            startIcon={<ContentCopyIcon />}
+            sx={{ color: 'white', borderColor: 'rgba(255,255,255,0.4)', fontSize: 12 }}
+          >
+            {copied ? 'Copied!' : 'Code'}
+          </Button>
+          <Button
+            variant="contained"
+            size="small"
+            onClick={shareMeetingLink}
+            startIcon={<ShareIcon />}
+            color="primary"
+            sx={{ fontSize: 12 }}
+          >
+            {linkCopied ? 'Link Copied!' : 'Share Link'}
+          </Button>
+          <Chip label={`${peers.length + 1} participant${peers.length !== 0 ? 's' : ''}`} color="primary" size="small" />
+        </Toolbar>
+
+        {peers.length === 0 && (
+          <Box sx={{
+            px: 2, py: 1,
+            bgcolor: 'rgba(33,150,243,0.15)',
+            borderTop: '1px solid rgba(33,150,243,0.3)',
+            display: 'flex', alignItems: 'center', gap: 1
+          }}>
+            <LinkIcon sx={{ fontSize: 16, color: 'primary.main' }} />
+            <Typography variant="caption" sx={{ color: 'grey.300', flexGrow: 1, wordBreak: 'break-all' }}>
+              {typeof window !== 'undefined' ? `${window.location.origin}/room/${roomId}` : ''}
+            </Typography>
+            <Button
+              size="small"
+              variant="text"
+              onClick={copyMeetingLink}
+              sx={{ color: 'primary.main', fontSize: 11, minWidth: 'auto', whiteSpace: 'nowrap' }}
+            >
+              {linkCopied ? '✓ Copied' : 'Copy Link'}
+            </Button>
+          </Box>
+        )}
+      </AppBar>
+
+      <Box sx={{ flex: 1, overflow: 'hidden', p: 1, position: 'relative' }}>
+        <VideoGrid userVideo={userVideo} userName={user.name} peers={peers} />
+        
+        {captions.length > 0 && (
+          <Box sx={{
+            position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)',
+            display: 'flex', flexDirection: 'column', gap: 0.5, alignItems: 'center',
+            width: '80%', maxWidth: 800, zIndex: 10, pointerEvents: 'none'
+          }}>
+            {captions.map((cap, i) => (
+              <Typography key={i} sx={{
+                bgcolor: 'rgba(0,0,0,0.75)', color: 'white', px: 2, py: 1, borderRadius: 2,
+                fontSize: { xs: 14, md: 16 }, textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+                animation: 'fadeIn 0.3s ease-in-out'
+              }}>
+                <strong style={{ color: '#90caf9' }}>{cap.userName}:</strong> {cap.text}
+              </Typography>
+            ))}
+          </Box>
+        )}
+      </Box>
+
+      <Paper sx={{ p: 2, display: 'flex', justifyContent: 'center', gap: 2, bgcolor: '#1e1e1e' }}>
+        <IconButton
+          onClick={toggleAudio}
+          sx={{ bgcolor: audioEnabled ? 'primary.main' : 'error.main', color: 'white',
+            '&:hover': { bgcolor: audioEnabled ? 'primary.dark' : 'error.dark' } }}
+        >
+          {audioEnabled ? <MicIcon /> : <MicOffIcon />}
+        </IconButton>
+        <IconButton
+          onClick={toggleVideo}
+          sx={{ bgcolor: videoEnabled ? 'primary.main' : 'error.main', color: 'white',
+            '&:hover': { bgcolor: videoEnabled ? 'primary.dark' : 'error.dark' } }}
+        >
+          {videoEnabled ? <VideocamIcon /> : <VideocamOffIcon />}
+        </IconButton>
+        <IconButton
+          onClick={toggleScreenShare}
+          sx={{ bgcolor: screenSharing ? 'success.main' : 'primary.main', color: 'white',
+            '&:hover': { bgcolor: screenSharing ? 'success.dark' : 'primary.dark' } }}
+        >
+          {screenSharing ? <StopScreenShareIcon /> : <ScreenShareIcon />}
+        </IconButton>
+        <Box sx={{ position: 'relative' }}>
+          <IconButton
+            onClick={() => setChatOpen(!chatOpen)}
+            sx={{ bgcolor: 'primary.main', color: 'white', '&:hover': { bgcolor: 'primary.dark' } }}
+          >
+            <ChatIcon />
+          </IconButton>
+          {unreadCount > 0 && (
+            <Box sx={{
+              position: 'absolute', top: -4, right: -4,
+              bgcolor: 'error.main', color: 'white', borderRadius: '50%',
+              width: 20, height: 20, display: 'flex',
+              alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, fontWeight: 'bold'
+            }}>
+              {unreadCount > 9 ? '9+' : unreadCount}
+            </Box>
+          )}
+        </Box>
+        <IconButton
+          onClick={leaveRoom}
+          title="Leave Room"
+          sx={{ bgcolor: 'error.main', color: 'white', '&:hover': { bgcolor: 'error.dark' } }}
+        >
+          <CallEndIcon />
+        </IconButton>
+        {isHost && (
+          <Button 
+            variant="contained" 
+            color="error" 
+            onClick={endMeeting}
+            sx={{ fontWeight: 'bold' }}
+          >
+            End Meeting
+          </Button>
+        )}
+      </Paper>
+
+      <Drawer
+        anchor="right"
+        open={chatOpen}
+        onClose={() => setChatOpen(false)}
+        PaperProps={{ sx: { width: 320, bgcolor: '#1e1e1e' } }}
+      >
+        <Box sx={{ p: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <Typography variant="h6">Chat</Typography>
+          <IconButton onClick={() => setChatOpen(false)}>
+            <CloseIcon />
+          </IconButton>
+        </Box>
+        <List sx={{ flex: 1, overflow: 'auto', px: 2 }}>
+          {messages.map((msg, idx) => (
+            <ListItem key={idx} sx={{ flexDirection: 'column', alignItems: 'flex-start', mb: 1 }}>
+              <Typography variant="caption" color="primary">{msg.userName}</Typography>
+              <Paper sx={{ p: 1, mt: 0.5, bgcolor: '#2e2e2e', width: '100%' }}>
+                <Typography variant="body2">{msg.message}</Typography>
+              </Paper>
+            </ListItem>
+          ))}
+        </List>
+        <Box sx={{ p: 2, display: 'flex', gap: 1 }}>
+          <TextField
+            fullWidth
+            size="small"
+            placeholder="Type a message..."
+            value={newMessage}
+            onChange={(e) => setNewMessage(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+          />
+          <Button variant="contained" onClick={sendMessage}>Send</Button>
+        </Box>
+      </Drawer>
+
+      {admissionRequests.map((req) => (
+        <Dialog key={req.socketId} open={true} maxWidth="xs" fullWidth>
+          <DialogTitle sx={{ pb: 1 }}>Someone wants to join</DialogTitle>
+          <DialogContent>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+              <Avatar sx={{ bgcolor: 'primary.main' }}>
+                {req.userName.charAt(0).toUpperCase()}
+              </Avatar>
+              <Typography variant="body1" fontWeight="bold">{req.userName}</Typography>
+            </Box>
+          </DialogContent>
+          <DialogActions sx={{ px: 3, pb: 2 }}>
+            <Button variant="outlined" color="error" onClick={() => denyUser(req.socketId)}>Deny</Button>
+            <Button variant="contained" color="primary" onClick={() => admitUser(req.socketId)}>Admit</Button>
+          </DialogActions>
+        </Dialog>
+      ))}
+    </Box>
+  );
+}
+
+function Video({ peer, userName }) {
+  const ref = useRef();
+  const [hasStream, setHasStream] = useState(false);
+
+  useEffect(() => {
+    const attachStream = (stream) => {
+      if (ref.current) {
+        ref.current.srcObject = stream;
+        setHasStream(true);
+      }
+    };
+
+    // Use our instantly captured remote stream to guarantee we never accidentally bind the local stream
+    if (peer.remoteStream) {
+      attachStream(peer.remoteStream);
+    } else if (peer._remoteStreams && peer._remoteStreams[0]) {
+      // Fallback for simple-peer internal remote streams array
+      attachStream(peer._remoteStreams[0]);
+    }
+
+    peer.on('stream', attachStream);
+    return () => {
+      peer.off('stream', attachStream);
+    };
+  }, [peer]);
+
+  return (
+    <>
+      <video
+        ref={ref}
+        autoPlay
+        playsInline
+        style={{ width: '100%', height: '100%', objectFit: 'cover', display: hasStream ? 'block' : 'none' }}
+      />
+      {!hasStream && (
+        <Box sx={{
+          width: '100%', height: '100%',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          bgcolor: '#2e2e2e'
+        }}>
+          <Typography sx={{ color: 'grey.500', fontSize: 14 }}>Connecting...</Typography>
+        </Box>
+      )}
+      <Typography sx={{
+        position: 'absolute', bottom: 12, left: 12,
+        color: 'white', bgcolor: 'rgba(0,0,0,0.6)',
+        px: 1.5, py: 0.5, borderRadius: 1, fontSize: 14
+      }}>
+        {userName}
+      </Typography>
+    </>
+  );
+}
+
+function VideoGrid({ userVideo, userName, peers }) {
+  const total = peers.length + 1;
+  const cols = total === 1 ? 1 : total <= 4 ? 2 : 3;
+  const rows = Math.ceil(total / cols);
+
+  const tileStyle = {
+    position: 'relative',
+    bgcolor: '#1e1e1e',
+    borderRadius: 1,
+    overflow: 'hidden',
+    gridColumn: 'span 1',
+  };
+
+  return (
+    <Box sx={{
+      display: 'grid',
+      gridTemplateColumns: `repeat(${cols}, 1fr)`,
+      gridTemplateRows: `repeat(${rows}, 1fr)`,
+      gap: 1,
+      width: '100%',
+      height: '100%',
+    }}>
+      <Box sx={tileStyle}>
+        <video
+          ref={userVideo}
+          autoPlay
+          playsInline
+          muted
+          style={{ width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
+        />
+        <Typography sx={{
+          position: 'absolute', bottom: 12, left: 12,
+          color: 'white', bgcolor: 'rgba(0,0,0,0.6)',
+          px: 1.5, py: 0.5, borderRadius: 1, fontSize: 14
+        }}>
+          {userName} (You)
+        </Typography>
+      </Box>
+
+      {peers.map((peer) => (
+        <Box key={peer.peerID} sx={tileStyle}>
+          <Video peer={peer.peer} userName={peer.userName} />
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+export default VideoRoom;
